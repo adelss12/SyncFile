@@ -1,35 +1,40 @@
 """
-محرك المزامنة بين مجلد على هذا الجهاز ونسخته على الفلاش.
+محرك المزامنة بين مجلدين (المصدر والهدف) في أي مكان: فلاش، قرص آخر، أو القسم نفسه.
+بعد المزامنة يصبح المجلدان متطابقين تماماً، بما في ذلك المجلدات الفرعية.
 
-القاعدة الذهبية: لا نسأل «أي ملف أحدث تاريخاً؟» لأن ساعة أحد الجهازين قد تكون خاطئة.
-بل نقارن كل طرف ببصمة الملف عند آخر مزامنة ناجحة لهذا الجهاز (الأساس):
-  • الطرف المطابق للأساس لم يتغير، والطرف المختلف عنه هو الذي عُدّل.
-  • إذا اختلف الطرفان كلاهما عن الأساس وعن بعضهما ← تعارض: نحتفظ بالنسختين.
-  • لا حذف نهائياً ولا كتابة فوق ملف: القديم يذهب أولاً إلى .نسخ_احتياطية
+كيف يعرف البرنامج أي ملف هو المعدَّل؟
+  1) إذا سبقت مزامنة بين المجلدين: يقارن كل طرف ببصمة الملف عند آخر مزامنة (محفوظة في ‎.syncfile‎).
+     الطرف المطابق للأساس لم يتغير، والمختلف هو المعدَّل — مهما كانت ساعة الجهاز.
+  2) في أول مزامنة (لا سجل سابق): يعتمد على تاريخ التعديل الأحدث، ويتحقق من الحجم:
+     إذا كان الأحدث هو الأكبر (أو الحجم نفسه) يُختار تلقائياً،
+     وإذا كان الأحدث تاريخاً أصغر حجماً ← «التوقيت غير متوافق» ويُعرض الملفان ليختار المستخدم.
+لا حذف نهائياً ولا كتابة فوق ملف: القديم ينتقل أولاً إلى ‎.نسخ_احتياطية‎ في الطرف نفسه.
 """
 
 import os
+import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from .carrier import Carrier, now_iso
-from .fsutil import (FAT32_LIMIT, INCOMING_SUFFIX, conflict_name, copy_verified, key_of, lp,
-                     open_in_office, quarantine, remove_empty_parents, scan)
+from .fsutil import (FAT32_LIMIT, INCOMING_SUFFIX, copy_verified, filesystem_of, key_of, lp, open_in_office,
+                     quarantine, remove_empty_parents, scan)
+from .meta import FolderMeta, now_iso
 
-EQUAL, PUSH, PULL, DEL_REMOTE, DEL_LOCAL, CONFLICT, FORGET = (
-    "equal", "push", "pull", "del_remote", "del_local", "conflict", "forget")
+EQUAL, A2B, B2A, DEL_A, DEL_B, CONFLICT, DECIDE, FORGET, SKIP = (
+    "equal", "a2b", "b2a", "del_a", "del_b", "conflict", "decide", "forget", "skip")
 
-LABELS = {
-    EQUAL: "متطابق",
-    PUSH: "سيُرسل إلى الفلاش",
-    PULL: "سيُحدَّث من الفلاش",
-    DEL_REMOTE: "سيُحذف من الفلاش (إلى النسخ الاحتياطية)",
-    DEL_LOCAL: "سيُحذف من هذا الجهاز (إلى النسخ الاحتياطية)",
-    CONFLICT: "تعارض — ستبقى النسختان",
-    FORGET: "حُذف من الطرفين",
-}
-NEW_LABEL = "ملف جديد"
+# أوضاع المهمة (مثل GoodSync)
+TWO_WAY, A_TO_B, B_TO_A = "two_way", "a_to_b", "b_to_a"
+MODES = {TWO_WAY: "مزامنة في الاتجاهين", A_TO_B: "نسخ احتياطي: من المصدر إلى الهدف فقط",
+         B_TO_A: "نسخ احتياطي: من الهدف إلى المصدر فقط"}
+
+# القرار عند الملفات التي تحتاج اختيار المستخدم (أو تغيير اتجاه أي ملف بالزر الأيمن)
+CHOOSE_A, CHOOSE_B, KEEP_BOTH, NO_COPY = "a", "b", "both", "skip"
+
+SIDE = {"a": "المصدر", "b": "الهدف"}
+TIME_TOLERANCE = 2.0          # ثانيتان: دقة التاريخ في أنظمة FAT
 
 
 @dataclass
@@ -37,58 +42,88 @@ class Item:
     key: str
     rel: str
     action: str
-    local: dict = None
-    remote: dict = None
+    a: dict = None
+    b: dict = None
     base: dict = None
     note: str = ""
-    blocked: str = ""          # سبب منع التنفيذ (ملف مفتوح، حجم لا يقبله الفلاش...)
+    blocked: str = ""
+    suggest: str = ""          # الاقتراح الافتراضي لقرار المستخدم
+    reason: str = ""           # new / modified / deleted / conflict / timing
 
     @property
-    def is_new(self):
-        return self.base is None and self.action in (PUSH, PULL)
+    def needs_choice(self):
+        return self.action in (CONFLICT, DECIDE)
 
     @property
     def label(self):
         if self.blocked:
             return "متوقف"
-        return NEW_LABEL + (" ← للفلاش" if self.action == PUSH else " ← لهذا الجهاز") if self.is_new else LABELS[self.action]
+        if self.action == EQUAL:
+            return "متطابق"
+        if self.action in (A2B, B2A):
+            to = "الهدف" if self.action == A2B else "المصدر"
+            return ("ملف جديد ← " if self.reason == "new" else "معدّل ← ") + to
+        if self.action == DEL_A:
+            return "سيُحذف من المصدر"
+        if self.action == DEL_B:
+            return "سيُحذف من الهدف"
+        if self.action == CONFLICT:
+            return "تعارض — يحتاج قرارك"
+        if self.action == DECIDE:
+            return "التوقيت غير متوافق — يحتاج قرارك"
+        if self.action == SKIP:
+            return "لن يُنسخ"
+        return "حُذف من الطرفين"
 
     @property
-    def size(self):
-        src = self.local if self.action in (PUSH, CONFLICT) else self.remote
-        return (src or self.local or self.remote or {}).get("size", 0)
+    def transfer_size(self):
+        if self.action == A2B:
+            return self.a["size"]
+        if self.action == B2A:
+            return self.b["size"]
+        if self.needs_choice:
+            return max((self.a or {}).get("size", 0), (self.b or {}).get("size", 0))
+        return 0
 
 
 @dataclass
 class Plan:
-    sid: str
-    name: str
-    local_root: Path
-    remote_root: Path
+    a_root: Path
+    b_root: Path
     items: list = field(default_factory=list)
-    errors: list = field(default_factory=list)      # أخطاء الفحص
+    errors: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
     mass_delete: bool = False
-    local_files: dict = None
-    remote_files: dict = None
+    first_sync: bool = True
+    a_files: dict = None
+    b_files: dict = None
+    base: dict = None
+    seq: int = 0
 
-    def count(self, action):
-        return sum(1 for i in self.items if i.action == action and not i.blocked)
+    def count(self, *actions):
+        return sum(1 for i in self.items if i.action in actions and not i.blocked)
+
+    def count_reason(self, reason):
+        return sum(1 for i in self.items if i.reason == reason and i.action in (A2B, B2A) and not i.blocked)
 
     @property
     def changes(self):
-        return [i for i in self.items if i.action not in (EQUAL, FORGET)]
+        return [i for i in self.items if i.action not in (EQUAL, FORGET, SKIP)]
+
+    @property
+    def decisions(self):
+        return [i for i in self.items if i.needs_choice and not i.blocked]
 
     @property
     def transfer_bytes(self):
-        return sum(i.size for i in self.items if i.action in (PUSH, PULL, CONFLICT) and not i.blocked)
+        return sum(i.transfer_size for i in self.items if not i.blocked)
 
 
 @dataclass
 class Result:
-    done: list = field(default_factory=list)         # (rel, الإجراء)
-    conflicts: list = field(default_factory=list)    # (rel, اسم نسخة التعارض)
-    errors: list = field(default_factory=list)       # (rel, السبب)
+    done: list = field(default_factory=list)
+    kept_both: list = field(default_factory=list)
+    errors: list = field(default_factory=list)
     cancelled: bool = False
     started: str = ""
     finished: str = ""
@@ -99,91 +134,144 @@ class SyncError(Exception):
     pass
 
 
+def fmt_time(mtime_ns) -> str:
+    return datetime.fromtimestamp(mtime_ns / 1e9).strftime("%Y-%m-%d %H:%M")
+
+
+def _inside(p: Path, q: Path) -> bool:
+    try:
+        p, q = Path(os.path.abspath(p)), Path(os.path.abspath(q))
+        return p == q or q in p.parents
+    except (OSError, ValueError):
+        return False
+
+
+def check_folders(a: Path, b: Path):
+    for p, side in ((a, "المصدر"), (b, "الهدف")):
+        if not p or not os.path.isdir(lp(p)):
+            raise SyncError(f"مجلد {side} غير موجود:\n{p}\n"
+                            "تأكد أن الفلاش أو القرص موصول وأن المجلد لم يُنقل، ثم أعد المحاولة.")
+    if _inside(a, b) or _inside(b, a):
+        raise SyncError("لا يمكن أن يكون أحد المجلدين داخل الآخر؛ اختر مجلدين منفصلين.")
+
+
 # ============================================================================
 # المعاينة: لا تلمس أي ملف
 # ============================================================================
 
-def build_plan(state, carrier: Carrier, sid: str, cancel=None) -> Plan:
-    local_root = state.local_path(sid)
-    remote_root = carrier.data_dir(sid)
-    plan = Plan(sid=sid, name=carrier.session_name(sid), local_root=local_root, remote_root=remote_root)
+def load_base(ma: FolderMeta, mb: FolderMeta):
+    pa, pb = ma.load_pair(mb.id), mb.load_pair(ma.id)
+    cands = [p for p in (pa, pb) if p]
+    if not cands:
+        return None
+    return max(cands, key=lambda p: p.get("seq", 0))
 
-    if local_root is None:
-        raise SyncError("هذه الجلسة غير مربوطة بمجلد على هذا الجهاز.")
-    if not os.path.isdir(lp(local_root)):
-        # بدون هذا الحاجز سيبدو كل شيء «محذوفاً» ويُحذف من الفلاش
-        raise SyncError(f"المجلد غير موجود على هذا الجهاز:\n{local_root}\n"
-                        "تأكد أن القرص موصول أو أن المجلد لم يُنقل، ثم أعد المحاولة.")
-    if not os.path.isdir(lp(remote_root)):
-        raise SyncError("مجلد الجلسة غير موجود على الفلاش.")
 
-    L = scan(local_root, state.cache(sid, "local"), cancel, plan.errors)
-    R = scan(remote_root, state.cache(sid, "carrier"), cancel, plan.errors)
-    B = state.baseline(sid)
-    plan.local_files, plan.remote_files = L, R
-    manifest = carrier.manifest(sid)
+def build_plan(a_root, b_root, cancel=None, mode=TWO_WAY, excludes=()) -> Plan:
+    a_root, b_root = Path(a_root), Path(b_root)
+    check_folders(a_root, b_root)
+    ma, mb = FolderMeta(a_root), FolderMeta(b_root)
+    plan = Plan(a_root=a_root, b_root=b_root)
 
-    fs = carrier.filesystem().upper()
-    for k in sorted(set(L) | set(R) | set(B)):
-        l, r, b = L.get(k), R.get(k), B.get(k)
-        lh, rh, bh = (l or {}).get("hash"), (r or {}).get("hash"), (b or {}).get("hash")
-        rel = (l or r or b)["rel"]
-        note = ""
-        if lh == rh:
-            action = EQUAL if lh else FORGET
-        elif lh == bh:                       # هنا لم يتغير ← التعديل من الجهاز الآخر
-            action = PULL if rh else DEL_LOCAL
-        elif rh == bh:                       # الفلاش لم يتغير ← التعديل من هنا
-            action = PUSH if lh else DEL_REMOTE
-        elif lh and rh:
-            action = CONFLICT
-            who = manifest["files"].get(k, {}).get("by") or "الجهاز الآخر"
-            note = f"عُدّل هنا وعُدّل على {who}"
-        elif lh:
-            action, note = PUSH, "حُذف من الفلاش وعُدّل هنا — يُبقى المعدّل"
-        else:
-            action, note = PULL, "حُذف هنا وعُدّل على الجهاز الآخر — يُبقى المعدّل"
+    A = scan(a_root, ma.cache(), cancel, plan.errors, excludes)
+    B = scan(b_root, mb.cache(), cancel, plan.errors, excludes)
+    base_doc = load_base(ma, mb) if ma.id and mb.id else None
+    base = (base_doc or {}).get("files", {})
+    plan.first_sync = base_doc is None
+    plan.seq = (base_doc or {}).get("seq", 0)
+    plan.a_files, plan.b_files, plan.base = A, B, base
 
-        item = Item(key=k, rel=rel, action=action, local=l, remote=r, base=b, note=note)
-        if action in (PULL, DEL_LOCAL, CONFLICT) and l and open_in_office(local_root / l["rel"]):
-            item.blocked = "الملف مفتوح في أوفيس على هذا الجهاز — أغلقه ثم أعد المزامنة"
-        if action in (PUSH, CONFLICT) and l and fs == "FAT32" and l["size"] > FAT32_LIMIT:
-            item.blocked = "حجمه أكبر من 4 جيجابايت والفلاش بنظام FAT32 (هيّئه بنظام exFAT)"
-        plan.items.append(item)
+    timing = 0
+    future = time.time() + 86400
+    fs_b, fs_a = filesystem_of(b_root).upper(), filesystem_of(a_root).upper()
+    for k in sorted(set(A) | set(B) | set(base)):
+        a, b, s = A.get(k), B.get(k), base.get(k)
+        ah, bh, sh = (a or {}).get("hash"), (b or {}).get("hash"), (s or {}).get("hash")
+        rel = (a or b or s)["rel"]
+        it = Item(key=k, rel=rel, action=EQUAL, a=a, b=b, base=s)
 
-    # فرامل الحذف الجماعي
-    for side, act in (("الفلاش", DEL_REMOTE), ("هذا الجهاز", DEL_LOCAL)):
+        if ah == bh:
+            it.action = EQUAL if ah else FORGET
+        elif s is not None:                              # يوجد سجل سابق لهذا الملف
+            if ah == sh:
+                it.action, it.reason = (B2A, "modified") if bh else (DEL_A, "deleted")
+            elif bh == sh:
+                it.action, it.reason = (A2B, "modified") if ah else (DEL_B, "deleted")
+            elif ah and bh:
+                it.action, it.reason, it.suggest = CONFLICT, "conflict", KEEP_BOTH
+                it.note = "عُدّل في المصدر وفي الهدف منذ آخر مزامنة"
+            elif ah:
+                it.action, it.reason, it.note = A2B, "modified", "حُذف من الهدف وعُدّل في المصدر — يُبقى المعدّل"
+            else:
+                it.action, it.reason, it.note = B2A, "modified", "حُذف من المصدر وعُدّل في الهدف — يُبقى المعدّل"
+        elif ah and not bh:
+            it.action, it.reason = A2B, "new"
+        elif bh and not ah:
+            it.action, it.reason = B2A, "new"
+        else:                                            # موجود في الطرفين ومختلف ولا سجل له
+            classify_first_time(it)
+            if it.action == DECIDE:
+                timing += 1
+
+        apply_mode(it, mode)
+        if it.action in (B2A, DEL_A) or (it.needs_choice and a):
+            if a and open_in_office(a_root / a["rel"]):
+                it.blocked = "الملف مفتوح في أوفيس في المصدر — أغلقه ثم أعد المزامنة"
+        if it.action in (A2B, DEL_B) or (it.needs_choice and b):
+            if b and open_in_office(b_root / b["rel"]):
+                it.blocked = "الملف مفتوح في أوفيس في الهدف — أغلقه ثم أعد المزامنة"
+        if it.action == A2B and fs_b == "FAT32" and a["size"] > FAT32_LIMIT:
+            it.blocked = "أكبر من 4 جيجابايت والهدف بنظام FAT32 (هيّئه بنظام exFAT)"
+        if it.action == B2A and fs_a == "FAT32" and b["size"] > FAT32_LIMIT:
+            it.blocked = "أكبر من 4 جيجابايت والمصدر بنظام FAT32"
+        plan.items.append(it)
+
+    if timing:
+        plan.warnings.append(f"🕒 التوقيت غير متوافق في {timing} ملف: الأحدث تاريخاً هو الأصغر حجماً. "
+                             "قد تكون ساعة أحد الجهازين خاطئة — ستختار النسخة الصحيحة بنفسك.")
+    fut = sum(1 for d in (A, B) for v in d.values() if v["mtime"] / 1e9 > future)
+    if fut:
+        plan.warnings.append(f"🕒 {fut} ملف تاريخه في المستقبل — ساعة الجهاز الذي عُدّل عليه غير صحيحة.")
+    for side, act in (("المصدر", DEL_A), ("الهدف", DEL_B)):
         n = plan.count(act)
-        if B and n >= 20 and n > len(B) * 0.5:
+        if base and n >= 20 and n > len(base) * 0.5:
             plan.mass_delete = True
             plan.warnings.append(f"⚠️ سيُحذف {n} ملف من {side} (أكثر من نصف الملفات). تأكد أن هذا مقصود.")
-
-    # ساعة هذا الجهاز مقارنة بآخر جهاز زامن
-    last = manifest.get("last_sync") or {}
-    if last.get("at") and last.get("device_id") != state.device_id:
-        try:
-            other = datetime.fromisoformat(last["at"])
-            diff = (datetime.now().astimezone() - other).total_seconds()
-            if diff < -600:
-                plan.warnings.append(
-                    f"🕒 ساعة هذا الجهاز متأخرة عن جهاز «{last.get('device', '؟')}» بنحو {human_delta(-diff)}. "
-                    "المزامنة لا تتأثر لأنها تعتمد على البصمة، لكن يُنصح بتصحيح الساعة.")
-        except (ValueError, TypeError):
-            pass
-
-    if plan.transfer_bytes and carrier.free_space() and plan.transfer_bytes > carrier.free_space():
-        plan.warnings.append("💾 المساحة المتاحة على الفلاش قد لا تكفي لكل الملفات.")
-    if fs == "FAT32":
-        plan.warnings.append("ℹ️ الفلاش بنظام FAT32 ولا يقبل ملفاً أكبر من 4 جيجابايت.")
+    if "FAT32" in (fs_a, fs_b):
+        plan.warnings.append("ℹ️ أحد المجلدين على قرص بنظام FAT32 ولا يقبل ملفاً أكبر من 4 جيجابايت.")
     return plan
 
 
-def human_delta(sec: float) -> str:
-    if sec < 3600:
-        return f"{int(sec // 60)} دقيقة"
-    if sec < 86400:
-        return f"{sec / 3600:.1f} ساعة"
-    return f"{sec / 86400:.1f} يوم"
+def apply_mode(it: Item, mode: str):
+    """النسخ الاحتياطي باتجاه واحد: لا يُنقل أي تغيير من الطرف الآخر ولا يُحذف منه شيء."""
+    if mode == A_TO_B:
+        if it.action in (B2A, DEL_A):
+            it.action, it.note = SKIP, "تغيّر في الهدف — وضع النسخ الاحتياطي لا ينقله إلى المصدر"
+        elif it.needs_choice:
+            it.suggest = CHOOSE_A
+    elif mode == B_TO_A:
+        if it.action in (A2B, DEL_B):
+            it.action, it.note = SKIP, "تغيّر في المصدر — وضع النسخ الاحتياطي لا ينقله إلى الهدف"
+        elif it.needs_choice:
+            it.suggest = CHOOSE_B
+
+
+def classify_first_time(it: Item):
+    """أول مزامنة لملف مختلف في الطرفين: التاريخ الأحدث، مع التحقق من الحجم."""
+    a, b = it.a, it.b
+    dt = (a["mtime"] - b["mtime"]) / 1e9
+    newer = "a" if dt > 0 else "b"
+    larger = "a" if a["size"] > b["size"] else ("b" if b["size"] > a["size"] else None)
+    if abs(dt) <= TIME_TOLERANCE:
+        it.action, it.reason = DECIDE, "timing"
+        it.suggest = larger or CHOOSE_A
+        it.note = "نفس التاريخ تقريباً والمحتوى مختلف"
+    elif larger is None or larger == newer:
+        it.action, it.reason = (A2B if newer == "a" else B2A), "modified"
+        it.note = f"الأحدث في {SIDE[newer]} ({fmt_time(it.a['mtime'] if newer == 'a' else it.b['mtime'])})"
+    else:
+        it.action, it.reason, it.suggest = DECIDE, "timing", larger
+        it.note = f"الأحدث تاريخاً في {SIDE[newer]} لكنه أصغر حجماً"
 
 
 # ============================================================================
@@ -191,9 +279,8 @@ def human_delta(sec: float) -> str:
 # ============================================================================
 
 def _replace(src_root, src_rel, src_hash, dst_root, dst_rel, old_rel, stamp, cancel, on_bytes):
-    """ينسخ ملفاً فوق آخر بأمان: النسخة الجديدة تُكتب وتُتحقق أولاً، والقديمة إلى النسخ الاحتياطية."""
-    src = Path(src_root) / src_rel
-    dst = Path(dst_root) / dst_rel
+    """النسخة الجديدة تُكتب وتُتحقق أولاً، ثم ينتقل القديم إلى ‎.نسخ_احتياطية‎، ثم تحل الجديدة مكانه."""
+    src, dst = Path(src_root) / src_rel, Path(dst_root) / dst_rel
     incoming = Path(str(dst) + INCOMING_SUFFIX)
     copy_verified(src, incoming, src_hash, cancel, on_bytes)
     if old_rel and os.path.exists(lp(Path(dst_root) / old_rel)):
@@ -201,123 +288,150 @@ def _replace(src_root, src_rel, src_hash, dst_root, dst_rel, old_rel, stamp, can
     os.replace(lp(incoming), lp(dst))
 
 
-def execute(plan: Plan, state, carrier: Carrier, cancel=None, progress=None) -> Result:
-    """progress(نُقل_بايت, الإجمالي, المسار_الحالي)"""
+def keep_both_name(rel: str, side: str, stamp: str) -> str:
+    folder, name = os.path.split(rel)
+    stem, ext = os.path.splitext(name)
+    new = f"{stem}_نسخة_{SIDE[side]}_{stamp}{ext}"
+    return f"{folder}/{new}" if folder else new
+
+
+def execute(plan: Plan, choices: dict = None, device: str = "", cancel=None, progress=None) -> Result:
+    """choices: {المفتاح: "a" أو "b" أو "both"} للملفات التي تحتاج قراراً."""
+    choices = choices or {}
     res = Result(started=now_iso())
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     cstamp = datetime.now().strftime("%Y-%m-%d_%H%M")
-    me = state.device_name
-    sid, L_root, R_root = plan.sid, plan.local_root, plan.remote_root
-    manifest = carrier.manifest(sid)
-    files = manifest["files"]
+    A, B = plan.a_root, plan.b_root
+    ma, mb = FolderMeta(A).ensure(), FolderMeta(B).ensure()
+    new_base = {}
     total = max(plan.transfer_bytes, 1)
-    moved = [0]
+    moved, current = [0], [""]
 
     def on_bytes(n):
         moved[0] += n
         if progress:
             progress(moved[0], total, current[0])
 
-    current = [""]
-    when = now_iso()
+    def remember(key, f):
+        new_base[key] = {"rel": f["rel"], "hash": f["hash"], "size": f["size"]}
+
     for it in plan.items:
         if cancel is not None and cancel.is_set():
             res.cancelled = True
-            break
-        if it.blocked:
-            res.errors.append((it.rel, it.blocked))
+        if res.cancelled:
+            if it.base:                                   # ما لم يُنفذ يبقى أساسه القديم
+                new_base[it.key] = it.base
             continue
         current[0] = it.rel
-        l, r = it.local, it.remote
+        a, b = it.a, it.b
+        if it.blocked:
+            res.errors.append((it.rel, it.blocked))
+            if it.base:
+                new_base[it.key] = it.base
+            continue
         try:
-            if it.action == EQUAL:
-                state.set_baseline(sid, it.key, l["rel"], l["hash"], l["size"], when)
-            elif it.action == FORGET:
-                state.drop_baseline(sid, it.key)
-                files.pop(it.key, None)
-            elif it.action == PUSH:
-                _replace(L_root, l["rel"], l["hash"], R_root, l["rel"], r and r["rel"], stamp, cancel, on_bytes)
-                files[it.key] = {"rel": l["rel"], "hash": l["hash"], "by": me, "at": when}
-                state.set_baseline(sid, it.key, l["rel"], l["hash"], l["size"], when)
-                res.done.append((it.rel, "أُرسل إلى الفلاش"))
-            elif it.action == PULL:
-                _replace(R_root, r["rel"], r["hash"], L_root, r["rel"], l and l["rel"], stamp, cancel, on_bytes)
-                state.set_baseline(sid, it.key, r["rel"], r["hash"], r["size"], when)
-                res.done.append((it.rel, "حُدّث من الفلاش"))
-            elif it.action == DEL_REMOTE:
-                quarantine(R_root, r["rel"], stamp)
-                remove_empty_parents(R_root, r["rel"])
-                files.pop(it.key, None)
-                state.drop_baseline(sid, it.key)
-                res.done.append((it.rel, "حُذف من الفلاش"))
-            elif it.action == DEL_LOCAL:
-                quarantine(L_root, l["rel"], stamp)
-                remove_empty_parents(L_root, l["rel"])
-                state.drop_baseline(sid, it.key)
-                res.done.append((it.rel, "حُذف من هذا الجهاز"))
-            elif it.action == CONFLICT:
-                other = files.get(it.key, {}).get("by") or "الجهاز-الآخر"
-                cname = conflict_name(l["rel"], other, cstamp)
-                ck = key_of(cname)
-                # 1) نسخة الطرف الآخر تُحفظ باسم التعارض على الجهاز والفلاش
-                copy_verified(Path(R_root) / r["rel"], Path(L_root) / cname, r["hash"], cancel, on_bytes)
-                copy_verified(Path(R_root) / r["rel"], Path(R_root) / cname, r["hash"], cancel)
-                # 2) نسخة هذا الجهاز تبقى بالاسم الأصلي في الطرفين
-                _replace(L_root, l["rel"], l["hash"], R_root, l["rel"], r["rel"], stamp, cancel, None)
-                files[it.key] = {"rel": l["rel"], "hash": l["hash"], "by": me, "at": when}
-                files[ck] = {"rel": cname, "hash": r["hash"], "by": other, "at": when}
-                state.set_baseline(sid, it.key, l["rel"], l["hash"], l["size"], when)
-                state.set_baseline(sid, ck, cname, r["hash"], r["size"], when)
-                res.conflicts.append((it.rel, cname))
-                res.done.append((it.rel, f"تعارض: حُفظت نسخة {other} باسم {Path(cname).name}"))
+            act = it.action
+            choice = choices.get(it.key)
+            if it.needs_choice and choice is None:
+                raise SyncError("لم يُحدَّد أي النسختين تريد — لم يُنسخ")
+            if choice is not None:                         # قرار المستخدم أو تغيير الاتجاه بالزر الأيمن
+                act = resolve_choice(it, choice)
+            if act == EQUAL:
+                remember(it.key, a)
+            elif act == FORGET:
+                pass
+            elif act == SKIP:
+                if it.base:
+                    new_base[it.key] = it.base
+            elif act == A2B:
+                _replace(A, a["rel"], a["hash"], B, a["rel"], b and b["rel"], stamp, cancel, on_bytes)
+                remember(it.key, a)
+                res.done.append((it.rel, "نُسخ من المصدر إلى الهدف"))
+            elif act == B2A:
+                _replace(B, b["rel"], b["hash"], A, b["rel"], a and a["rel"], stamp, cancel, on_bytes)
+                remember(it.key, b)
+                res.done.append((it.rel, "نُسخ من الهدف إلى المصدر"))
+            elif act == DEL_A:
+                quarantine(A, a["rel"], stamp)
+                remove_empty_parents(A, a["rel"])
+                res.done.append((it.rel, "حُذف من المصدر (إلى النسخ الاحتياطية)"))
+            elif act == DEL_B:
+                quarantine(B, b["rel"], stamp)
+                remove_empty_parents(B, b["rel"])
+                res.done.append((it.rel, "حُذف من الهدف (إلى النسخ الاحتياطية)"))
+            elif act == "both":
+                # نسخة المصدر تبقى بالاسم الأصلي، ونسخة الهدف تُحفظ باسم واضح في الطرفين
+                other = keep_both_name(b["rel"], "b", cstamp)
+                copy_verified(B / b["rel"], A / other, b["hash"], cancel, on_bytes)
+                copy_verified(B / b["rel"], B / other, b["hash"], cancel)
+                _replace(A, a["rel"], a["hash"], B, a["rel"], b["rel"], stamp, cancel, None)
+                remember(it.key, a)
+                remember(key_of(other), {"rel": other, "hash": b["hash"], "size": b["size"]})
+                res.kept_both.append((it.rel, other))
+                res.done.append((it.rel, f"حُفظت النسختان (نسخة الهدف باسم {Path(other).name})"))
         except InterruptedError:
             res.cancelled = True
-            break
-        except Exception as e:  # ملف مقفل أو صلاحيات: نسجل ونكمل، ولا نحدّث أساسه
+            if it.base:
+                new_base[it.key] = it.base
+        except Exception as e:
             res.errors.append((it.rel, _friendly(e)))
-        state.commit()
+            if it.base:                                   # الفشل لا يغيّر الأساس فيُعاد في المرة القادمة
+                new_base[it.key] = it.base
 
-    manifest["last_sync"] = {"device": me, "device_id": state.device_id, "at": now_iso()}
-    carrier.save_manifest(sid, manifest)
-    state.save_cache(sid, "local", plan.local_files or {})
-    state.save_cache(sid, "carrier", plan.remote_files or {})
+    doc = {"seq": plan.seq + 1, "sync_id": uuid.uuid4().hex, "at": now_iso(), "device": device,
+           "a": str(A), "b": str(B), "files": new_base}
+    for m, other in ((ma, mb), (mb, ma)):
+        try:
+            m.save_pair(other.id, doc)
+        except OSError as e:
+            res.errors.append((str(m.root), f"تعذر حفظ سجل المزامنة: {e}"))
+    for m, files in ((ma, plan.a_files), (mb, plan.b_files)):
+        try:
+            m.save_cache(files or {})
+        except OSError:
+            pass
     res.bytes = moved[0]
     res.finished = now_iso()
     return res
 
 
+def resolve_choice(it: Item, choice: str) -> str:
+    """يحوّل اختيار المستخدم إلى إجراء، مع مراعاة أن يكون الملف موجوداً في الطرف المنسوخ منه."""
+    if choice == NO_COPY:
+        return SKIP
+    if choice == KEEP_BOTH:
+        return "both" if (it.a and it.b) else (A2B if it.a else B2A)
+    if choice == CHOOSE_A:
+        return A2B if it.a else DEL_B          # المصدر بلا الملف ← اختيار المصدر يعني حذفه من الهدف
+    if choice == CHOOSE_B:
+        return B2A if it.b else DEL_A
+    raise SyncError("اختيار غير معروف")
+
+
+def choices_for(it: Item):
+    """الخيارات المتاحة لملف في القائمة (للزر الأيمن ونافذة القرار)."""
+    out = []
+    if it.a:
+        out.append((CHOOSE_A, "نسخة المصدر ← إلى الهدف"))
+    else:
+        out.append((CHOOSE_A, "حذفه من الهدف (كما في المصدر)"))
+    if it.b:
+        out.append((CHOOSE_B, "نسخة الهدف ← إلى المصدر"))
+    else:
+        out.append((CHOOSE_B, "حذفه من المصدر (كما في الهدف)"))
+    if it.a and it.b:
+        out.append((KEEP_BOTH, "الاحتفاظ بالنسختين"))
+    out.append((NO_COPY, "لا تنسخ الآن"))
+    return out
+
+
 def _friendly(e: Exception) -> str:
+    if isinstance(e, SyncError):
+        return str(e)
     if isinstance(e, PermissionError):
         return "الملف مقفل أو مفتوح في برنامج آخر، أو لا توجد صلاحية — أغلقه وأعد المزامنة"
     if isinstance(e, FileNotFoundError):
-        return "اختفى الملف أثناء المزامنة (ربما نُقل أو سُحب الفلاش)"
+        return "اختفى الملف أثناء المزامنة (ربما نُقل أو فُصل الفلاش)"
     if isinstance(e, OSError) and getattr(e, "errno", None) == 28:
         return "لا توجد مساحة كافية"
     return str(e)
-
-
-# ============================================================================
-# الجلسات
-# ============================================================================
-
-def create_session(state, carrier: Carrier, local_folder: Path) -> str:
-    """زر (+): ينشئ جلسة على الفلاش باسم المجلد ويربطها بهذا الجهاز."""
-    local_folder = Path(local_folder)
-    if not local_folder.is_dir():
-        raise SyncError("اختر مجلداً موجوداً.")
-    for s in carrier.sessions():
-        if state.local_path(s["id"]) and Path(state.local_path(s["id"])).resolve() == local_folder.resolve():
-            raise SyncError("هذا المجلد مربوط بجلسة موجودة أصلاً.")
-    carrier.init()
-    sid = carrier.create_session(local_folder.name, state.device_name)
-    state.link_session(sid, local_folder.name, local_folder)
-    return sid
-
-
-def join_session(state, carrier: Carrier, sid: str, parent: Path) -> Path:
-    """جلسة موجودة على الفلاش وجديدة على هذا الجهاز: ينشئ مجلداً بالاسم نفسه ويربطه."""
-    name = carrier.session_name(sid)
-    target = Path(parent) / name
-    os.makedirs(lp(target), exist_ok=True)
-    state.link_session(sid, name, target)
-    return target

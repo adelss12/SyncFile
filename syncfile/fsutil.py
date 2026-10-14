@@ -3,9 +3,11 @@
 كل الأسماء تُعامل كنص Unicode (UTF-8)، فلا تتشوه الأسماء العربية أو التشكيل.
 """
 
+import fnmatch
 import hashlib
 import os
 import shutil
+import time
 import unicodedata
 from pathlib import Path
 
@@ -57,7 +59,7 @@ def file_hash(path, cancel=None, block=1024 * 1024):
     return h.hexdigest()
 
 
-def scan(root: Path, cache: dict, cancel=None, errors=None):
+def scan(root: Path, cache: dict, cancel=None, errors=None, excludes=()):
     """
     يفحص المجلد ويُرجع {المفتاح: {"rel", "size", "mtime", "hash"}}.
     البصمة تُحسب فقط للملفات التي تغيّر حجمها أو تاريخها منذ آخر فحص (cache)،
@@ -67,13 +69,17 @@ def scan(root: Path, cache: dict, cancel=None, errors=None):
     errors = errors if errors is not None else []
     root = Path(root)
     for dirpath, dirs, files in os.walk(lp(root)):
-        dirs[:] = [d for d in dirs if d not in RESERVED_DIRS]
+        here = os.path.relpath(dirpath, lp(root)).replace("\\", "/")
+        dirs[:] = [d for d in dirs if d not in RESERVED_DIRS
+                   and not excluded(d, d if here == "." else f"{here}/{d}", excludes)]
         for name in files:
             if is_ignored(name):
                 continue
             full = Path(dirpath) / name
             rel = os.path.relpath(str(full), lp(root)).replace("\\", "/")
             rel = unicodedata.normalize("NFC", rel)
+            if excluded(name, rel, excludes):
+                continue
             try:
                 st = os.stat(str(full))
                 k = key_of(rel)
@@ -193,3 +199,34 @@ def conflict_name(rel: str, device: str, stamp: str) -> str:
     safe_dev = "".join(c if c.isalnum() or c in "-_" else "-" for c in (device or "جهاز-آخر"))
     new = f"{stem}_تعارض_{safe_dev}_{stamp}{ext}"
     return f"{folder}/{new}" if folder else new
+
+
+def parse_excludes(text: str):
+    """«*.bak; مؤقت; ملفات قديمة/*» ← قائمة أنماط (اسم ملف أو مجلد أو مسار)."""
+    return tuple(p.strip() for p in (text or "").replace("،", ";").split(";") if p.strip())
+
+
+def excluded(name: str, rel: str, patterns) -> bool:
+    for pat in patterns:
+        pl = pat.lower()
+        if fnmatch.fnmatch(name.lower(), pl) or fnmatch.fnmatch(rel.lower(), pl):
+            return True
+    return False
+
+
+def cleanup_backups(root: Path, days: int = 30) -> int:
+    """يحذف من ‎.نسخ_احتياطية‎ ما مضى عليه أكثر من {days} يوماً (كما يفعل GoodSync مع _saved)."""
+    q = Path(root) / QUARANTINE_DIR
+    if days <= 0 or not os.path.isdir(lp(q)):
+        return 0
+    limit = time.time() - days * 86400
+    removed = 0
+    for d in os.listdir(lp(q)):
+        p = q / d
+        try:
+            if os.path.isdir(lp(p)) and os.stat(lp(p)).st_mtime < limit:
+                shutil.rmtree(lp(p))
+                removed += 1
+        except OSError:
+            pass
+    return removed
